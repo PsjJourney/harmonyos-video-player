@@ -3,6 +3,7 @@ import { fileIo } from '@kit.CoreFileKit';
 import { PlayerState, PlaybackSpeed } from '../common/Enums';
 import { Constants } from '../common/Constants';
 import { FFmpegNative, FFmpegDecoderInstance } from '../native/FFmpegNative';
+import { PlayerError, PlayerErrorCode, createPlayerError, mapFFmpegError } from '../common/PlayerError';
 
 /**
  * 播放器事件回调接口
@@ -12,7 +13,7 @@ export interface PlayerCallback {
   onTimeUpdate?: (currentTime: number) => void;
   onDurationUpdate?: (duration: number) => void;
   onBufferingUpdate?: (isBuffering: boolean) => void;
-  onError?: (errorCode: number, errorMsg: string) => void;
+  onError?: (error: PlayerError) => void;
   onCompleted?: () => void;
 }
 
@@ -216,7 +217,10 @@ export class VideoPlayerManager {
     this.avPlayer.on('error', (err) => {
       console.error(`AVPlayer error: ${err.code} - ${err.message}`);
       this._state = PlayerState.ERROR;
-      this.callback?.onError?.(err.code, err.message);
+      // 将 AVPlayer 错误码映射到统一错误码
+      const errorCode = this.mapAVPlayerErrorCode(err.code, err.message);
+      const playerError = createPlayerError(errorCode, `AVPlayer 错误: [${err.code}] ${err.message}`);
+      this.callback?.onError?.(playerError);
     });
   }
 
@@ -438,5 +442,63 @@ export class VideoPlayerManager {
       'released': PlayerState.IDLE
     };
     return stateMap[state] || PlayerState.IDLE;
+  }
+
+  /**
+   * 将 AVPlayer 错误码映射到统一的 PlayerErrorCode
+   */
+  private mapAVPlayerErrorCode(avCode: number, avMsg: string): PlayerErrorCode {
+    // AVPlayer 常见错误码
+    // 5400101: 文件不存在或无法打开
+    // 5400102: 不支持的格式
+    // 5400103: 解码错误
+    // 5400104: 网络错误
+    // 5400105: 未知错误
+    const msg = avMsg.toLowerCase();
+
+    switch (avCode) {
+      case 5400101:
+        if (msg.includes('permission') || msg.includes('权限')) {
+          return PlayerErrorCode.PERMISSION_DENIED;
+        }
+        if (msg.includes('not found') || msg.includes('找不到')) {
+          return PlayerErrorCode.FILE_NOT_FOUND;
+        }
+        return PlayerErrorCode.FILE_READ_ERROR;
+
+      case 5400102:
+        if (msg.includes('codec') || msg.includes('解码器')) {
+          return PlayerErrorCode.DECODER_NOT_FOUND;
+        }
+        if (msg.includes('format') || msg.includes('格式')) {
+          return PlayerErrorCode.FILE_FORMAT_UNKNOWN;
+        }
+        return PlayerErrorCode.UNSUPPORTED_CODEC;
+
+      case 5400103:
+        return PlayerErrorCode.DECODE_ERROR;
+
+      case 5400104:
+        if (msg.includes('timeout') || msg.includes('超时')) {
+          return PlayerErrorCode.NETWORK_TIMEOUT;
+        }
+        if (msg.includes('dns') || msg.includes('域名')) {
+          return PlayerErrorCode.NETWORK_DNS_ERROR;
+        }
+        return PlayerErrorCode.NETWORK_UNAVAILABLE;
+
+      default:
+        // 尝试从消息内容判断
+        if (msg.includes('codec') || msg.includes('format')) {
+          return PlayerErrorCode.UNSUPPORTED_CODEC;
+        }
+        if (msg.includes('network') || msg.includes('http')) {
+          return PlayerErrorCode.NETWORK_UNAVAILABLE;
+        }
+        if (msg.includes('surface') || msg.includes('render')) {
+          return PlayerErrorCode.RENDERER_SURFACE_ERROR;
+        }
+        return PlayerErrorCode.UNKNOWN;
+    }
   }
 }
