@@ -1,0 +1,12 @@
+{
+  "name": "video-player",
+  "version": "1.0.0",
+  "description": "HarmonyOS Tablet Video Player",
+  "main": "",
+  "author": "pp",
+  "license": "Apache-2.0",
+  "dependencies": {},
+  "devDependencies": {
+    "@ohos/hypium": "1.0.18"
+  }
+}

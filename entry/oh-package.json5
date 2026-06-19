@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "Video Player for HarmonyOS Tablet",
+  "main": "",
+  "author": "pp",
+  "license": "Apache-2.0",
+  "dependencies": {}
+}
