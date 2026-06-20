@@ -1,4 +1,4 @@
-import { fileIo } from '@kit.CoreFileKit';
+﻿import { fileIo } from '@kit.CoreFileKit';
 import util from '@ohos.util';
 import { VideoPlayerManager } from '../service/VideoPlayerManager';
 import { ControlPanel } from './ControlPanel';
@@ -405,6 +405,19 @@ export struct VideoPlayerView {
     }
   }
 
+  private togglePlayback(): void {
+    if (this.isPlaying) {
+      this.ijkPlayer.pause();
+      this.playerState = PlayerState.PAUSED;
+      this.isPlaying = false;
+      this.isBuffering = false;
+      return;
+    }
+    this.ijkPlayer.start();
+    this.playerState = PlayerState.PLAYING;
+    this.isPlaying = true;
+  }
+
   private async saveProgress(): Promise<void> {
     if (this.duration <= 0) return;
 
@@ -781,16 +794,7 @@ export struct VideoPlayerView {
         isMuted: this.isMuted,
         isBuffering: this.isBuffering,
         onPlayPause: async () => {
-          if (this.isPlaying) {
-            this.ijkPlayer.pause();
-            this.playerState = PlayerState.PAUSED;
-            this.isPlaying = false;
-            this.isBuffering = false;
-          } else {
-            this.ijkPlayer.start();
-            this.playerState = PlayerState.PLAYING;
-            this.isPlaying = true;
-          }
+          this.togglePlayback();
         },
         onSeek: async (timeMs: number) => {
           if (this.isPlaying) {

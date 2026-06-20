@@ -1,4 +1,4 @@
-import { TimeUtils } from '../utils/TimeUtils';
+﻿import { TimeUtils } from '../utils/TimeUtils';
 import { PlayerState, PlaybackSpeed } from '../common/Enums';
 
 @Component
@@ -30,6 +30,9 @@ export struct ControlPanel {
   private timerId: number = -1;
   private autoHidePollId: number = -1;
   private lastAutoHideSignature: string = '';
+  private singleTapTimerId: number = -1;
+  private lastTapTimestamp: number = 0;
+  private readonly doubleTapThresholdMs: number = 280;
 
   aboutToAppear(): void {
     this.syncAutoHideState();
@@ -38,6 +41,7 @@ export struct ControlPanel {
 
   aboutToDisappear(): void {
     this.clearTimer();
+    this.clearSingleTapTimer();
     this.stopAutoHidePolling();
   }
 
@@ -91,6 +95,44 @@ export struct ControlPanel {
     }
   }
 
+  private clearSingleTapTimer(): void {
+    if (this.singleTapTimerId >= 0) {
+      clearTimeout(this.singleTapTimerId);
+      this.singleTapTimerId = -1;
+    }
+  }
+
+  private toggleControlsVisibility(): void {
+    if (this.showControls) {
+      this.showControls = false;
+      this.clearTimer();
+      return;
+    }
+    this.showAndAutoHide();
+  }
+
+  private handleBackgroundTap(): void {
+    if (this.isDragging) {
+      return;
+    }
+    const now = Date.now();
+    const isDoubleTap = this.lastTapTimestamp > 0 && now - this.lastTapTimestamp <= this.doubleTapThresholdMs;
+    if (isDoubleTap) {
+      this.lastTapTimestamp = 0;
+      this.clearSingleTapTimer();
+      this.onPlayPause();
+      this.syncAutoHideState();
+      return;
+    }
+    this.lastTapTimestamp = now;
+    this.clearSingleTapTimer();
+    this.singleTapTimerId = setTimeout(() => {
+      this.singleTapTimerId = -1;
+      this.lastTapTimestamp = 0;
+      this.toggleControlsVisibility();
+    }, this.doubleTapThresholdMs);
+  }
+
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
       if (this.isBuffering) {
@@ -109,8 +151,8 @@ export struct ControlPanel {
         Column() {
           Row({ space: 12 }) {
             Image($r('app.media.ic_arrow_back'))
-              .width(22)
-              .height(22)
+              .width(44)
+              .height(44)
               .fillColor('#FFFFFF')
               .padding(8)
               .backgroundColor('rgba(255,255,255,0.08)')
@@ -196,14 +238,14 @@ export struct ControlPanel {
 
               Blank()
 
-              Image($r('app.media.ic_skip_previous'))
+              /*Image($r('app.media.ic_skip_previous'))
                 .width(32)
                 .height(32)
                 .fillColor('#FFFFFF')
                 .onClick(() => {
                   this.onPrevious();
                   this.showAndAutoHide();
-                })
+                })*/
 
               Image($r('app.media.ic_replay_10'))
                 .width(36)
@@ -234,14 +276,14 @@ export struct ControlPanel {
                   this.showAndAutoHide();
                 })
 
-              Image($r('app.media.ic_skip_next'))
+              /*Image($r('app.media.ic_skip_next'))
                 .width(32)
                 .height(32)
                 .fillColor('#FFFFFF')
                 .onClick(() => {
                   this.onNext();
                   this.showAndAutoHide();
-                })
+                })*/
 
               Blank()
 
@@ -276,15 +318,7 @@ export struct ControlPanel {
     .width('100%')
     .height('100%')
     .onClick(() => {
-      if (this.isDragging) {
-        return;
-      }
-      if (this.showControls) {
-        this.showControls = false;
-        this.clearTimer();
-      } else {
-        this.showAndAutoHide();
-      }
+      this.handleBackgroundTap();
     })
   }
 }

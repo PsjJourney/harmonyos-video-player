@@ -434,7 +434,7 @@ export class VideoPlayerManager {
     }
   }
 
-  // ========== 鎾斁鎺у埗 ==========
+  // ========== 播放控制 ==========
 
   async play(): Promise<void> {
     if (this.useFFmpeg && this.ffmpegDecoder) {

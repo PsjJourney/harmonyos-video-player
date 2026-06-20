@@ -5,8 +5,13 @@
 .idea/
 .hvigor/
 .codegenie/
+.appanalyzer/
+.reasonix/
+.clangd
+.clang-tidy
 entry/.cxx/
 entry/build/
+entry/.preview/
 entry/src/main/cpp/build_*/
 
 # Package caches
