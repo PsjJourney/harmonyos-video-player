@@ -1,6 +1,7 @@
-import { router } from '@kit.ArkUI';
+﻿import { router } from '@kit.ArkUI';
 import { window } from '@kit.ArkUI';
 import { PlayHistoryService } from '../service/PlayHistoryService';
+import { SettingsService } from '../service/SettingsService';
 import { PlaybackSpeed, ScreenOrientation } from '../common/Enums';
 
 @Entry
@@ -17,9 +18,11 @@ struct SettingsPage {
   @State safeAreaTop: number = 0;
 
   private historyService: PlayHistoryService = PlayHistoryService.getInstance();
+  private settingsService: SettingsService = SettingsService.getInstance();
 
   async aboutToAppear(): Promise<void> {
     await this.initSafeArea();
+    this.showSubtitle = await this.settingsService.getShowSubtitle();
     try {
       const history = await this.historyService.getHistory();
       this.historyCount = history.length;
@@ -47,7 +50,6 @@ struct SettingsPage {
 
   build() {
     Column() {
-      // 顶部安全区域占位
       Column()
         .width('100%')
         .height(this.safeAreaTop)
@@ -113,6 +115,7 @@ struct SettingsPage {
         ListItem() {
           this.SwitchItem('Show subtitles', this.showSubtitle, (val: boolean) => {
             this.showSubtitle = val;
+            this.settingsService.setShowSubtitle(val);
           })
         }
 

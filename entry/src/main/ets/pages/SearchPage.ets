@@ -1,4 +1,4 @@
-import { router } from '@kit.ArkUI';
+﻿import { router } from '@kit.ArkUI';
 import { window } from '@kit.ArkUI';
 import { MediaScanner } from '../service/MediaScanner';
 import { VideoCard, VideoItemObserved } from '../components/VideoCard';

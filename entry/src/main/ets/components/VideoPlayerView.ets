@@ -1,9 +1,12 @@
-﻿import { VideoPlayerManager } from '../service/VideoPlayerManager';
+﻿import { fileIo } from '@kit.CoreFileKit';
+import util from '@ohos.util';
+import { VideoPlayerManager } from '../service/VideoPlayerManager';
 import { ControlPanel } from './ControlPanel';
 import { ErrorToast } from './ErrorDialog';
 import { PlayerState, PlaybackSpeed } from '../common/Enums';
 import { PlayerError, PlayerErrorCode, createPlayerError } from '../common/PlayerError';
 import { PlayHistoryService } from '../service/PlayHistoryService';
+import { SettingsService } from '../service/SettingsService';
 import { common } from '@kit.AbilityKit';
 import {
   IjkMediaPlayer,
@@ -13,12 +16,19 @@ import {
   OnInfoListener,
   OnPreparedListener,
   OnSeekCompleteListener,
+  OnTimedTextListener,
   OnVideoSizeChangedListener,
   VideoCodecMode
 } from '@ohos/ijkplayer';
 
 interface ErrorWithCode extends Error {
   code: number;
+}
+
+interface SubtitleCue {
+  startMs: number;
+  endMs: number;
+  text: string;
 }
 
 const VIDEO_SURFACE_COMPONENT_ID: string = 'video_player_surface';
@@ -29,6 +39,11 @@ const MEDIA_INFO_BUFFERING_END: number = 702;
 const MEDIA_INFO_VIDEO_SEEK_RENDERING_START: number = 10008;
 const MEDIA_INFO_AUDIO_SEEK_RENDERING_START: number = 10009;
 const MEDIA_INFO_MEDIA_ACCURATE_SEEK_COMPLETE: number = 10100;
+const SUBTITLE_EXTENSIONS: string[] = ['.ass', '.ssa', '.srt', '.vtt'];
+const SUBTITLE_ENCODINGS: string[] = ['utf-8', 'utf-16le', 'utf-16be', 'gb18030', 'gbk', 'big5'];
+const RESUME_MIN_POSITION_MS: number = 5000;
+const RESUME_END_GUARD_MS: number = 3000;
+const RESUME_FLOW_TAG: string = '[ResumeFlow]';
 
 @Component
 export struct VideoPlayerView {
@@ -36,6 +51,7 @@ export struct VideoPlayerView {
   @Prop videoTitle: string;
   @Prop videoId: string;
 
+  @Prop seekTo: number = 0;
   onBack: () => void = () => {};
   onNext: () => void = () => {};
   onPrevious: () => void = () => {};
@@ -55,6 +71,8 @@ export struct VideoPlayerView {
   @State toastMessage: string = '';
   @State engineType: string = 'IjkPlayer';
   @State videoAspectRatio: number = 16 / 9;
+  @State subtitleText: string = '';
+  @State subtitlesEnabled: boolean = true;
 
   private saveTimerId: number = -1;
   private progressTimerId: number = -1;
@@ -66,18 +84,29 @@ export struct VideoPlayerView {
   private pendingStartToken: number = 0;
   private ijkPlayer: IjkMediaPlayer = new IjkMediaPlayer(VIDEO_SURFACE_COMPONENT_ID);
   private nativeContext: Object | undefined = undefined;
+  private timedTextReady: boolean = false;
+  private externalSubtitleCues: SubtitleCue[] = [];
+  private pendingResumePosition: number = 0;
+  private hasAppliedResumeSeek: boolean = false;
 
   async aboutToAppear(): Promise<void> {
     console.info('[VideoPlayerView] aboutToAppear - videoPath:', this.videoPath);
     console.info('[VideoPlayerView] aboutToAppear - videoTitle:', this.videoTitle);
     console.info('[VideoPlayerView] aboutToAppear - videoId:', this.videoId);
+    console.info(RESUME_FLOW_TAG + ' aboutToAppear seekTo=' + this.seekTo + ' videoId=' + this.videoId + ' path=' + this.videoPath);
 
+    this.pendingResumePosition = this.seekTo;
+    this.hasAppliedResumeSeek = false;
+    this.subtitlesEnabled = await SettingsService.getInstance().getShowSubtitle();
+    await this.loadExternalSubtitles();
     await this.initPlayerManager();
     await this.startPlaybackIfReady();
   }
 
   async aboutToDisappear(): Promise<void> {
     this.pendingStartToken++;
+    this.currentTime = this.ijkPlayer.getCurrentPosition();
+    this.duration = this.ijkPlayer.getDuration();
     this.stopProgressTimer();
     if (this.saveTimerId >= 0) {
       clearInterval(this.saveTimerId);
@@ -87,6 +116,7 @@ export struct VideoPlayerView {
     this.playbackStarted = false;
     this.playbackStarting = false;
     this.isBuffering = false;
+    this.subtitleText = '';
     try {
       this.ijkPlayer.release();
     } catch (error) {
@@ -111,6 +141,8 @@ export struct VideoPlayerView {
         this.duration = this.ijkPlayer.getDuration();
         this.isBuffering = false;
         this.engineType = 'IjkPlayer';
+        this.applyResumeSeekIfNeeded();
+        this.updateExternalSubtitleForCurrentTime();
         console.info('[VideoPlayerView] ijk prepared, duration:', this.duration);
       }
     } as OnPreparedListener);
@@ -120,6 +152,7 @@ export struct VideoPlayerView {
         this.playerState = PlayerState.COMPLETED;
         this.isPlaying = false;
         this.isBuffering = false;
+        this.subtitleText = '';
         this.stopProgressTimer();
         this.saveProgress();
       }
@@ -134,7 +167,9 @@ export struct VideoPlayerView {
     this.ijkPlayer.setOnSeekCompleteListener({
       onSeekComplete: () => {
         this.currentTime = this.ijkPlayer.getCurrentPosition();
+        console.info(RESUME_FLOW_TAG + ' onSeekComplete currentTime=' + this.currentTime);
         this.isBuffering = false;
+        this.updateExternalSubtitleForCurrentTime();
         if (this.isPlaying) {
           this.playerState = PlayerState.PLAYING;
         }
@@ -151,7 +186,7 @@ export struct VideoPlayerView {
 
     this.ijkPlayer.setOnInfoListener({
       onInfo: (what: number, extra: number) => {
-        console.info('[VideoPlayerView] ijk info what=' + what + ' extra=' + extra);
+        // console.info('[VideoPlayerView] ijk info what=' + what + ' extra=' + extra);
         switch (what) {
           case MEDIA_INFO_BUFFERING_START:
             this.isBuffering = this.isPlaying;
@@ -166,6 +201,7 @@ export struct VideoPlayerView {
               this.playerState = PlayerState.PLAYING;
             }
             this.currentTime = this.ijkPlayer.getCurrentPosition();
+            this.updateExternalSubtitleForCurrentTime();
             break;
           default:
             break;
@@ -173,12 +209,31 @@ export struct VideoPlayerView {
       }
     } as OnInfoListener);
 
+    this.ijkPlayer.setOnTimedTextListener({
+      onTimedText: (text: string) => {
+        console.info('[VideoPlayerView] subtitle timed text raw=' + JSON.stringify(text));
+        if (this.hasExternalSubtitles()) {
+          console.info('[VideoPlayerView] subtitle timed text ignored because external subtitles are active');
+          return;
+        }
+        this.timedTextReady = true;
+        if (!this.subtitlesEnabled) {
+          console.info('[VideoPlayerView] subtitle timed text ignored because subtitles are disabled');
+          this.subtitleText = '';
+          return;
+        }
+        this.subtitleText = this.normalizeSubtitleText(text);
+        console.info('[VideoPlayerView] subtitle timed text normalized=' + JSON.stringify(this.subtitleText));
+      }
+    } as OnTimedTextListener);
+
     this.ijkPlayer.setOnErrorListener({
       onError: (what: number, extra: number) => {
         console.error(`[VideoPlayerView] ijk error what=${what} extra=${extra}`);
         this.stopProgressTimer();
         this.isPlaying = false;
         this.isBuffering = false;
+        this.subtitleText = '';
         this.playerState = PlayerState.ERROR;
         this.handleError(createPlayerError(PlayerErrorCode.UNKNOWN,
           `IjkPlayer error: what=${what}, extra=${extra}`));
@@ -190,6 +245,31 @@ export struct VideoPlayerView {
     console.info('[VideoPlayerView] engine type:', this.engineType);
   }
 
+  private applyResumeSeekIfNeeded(): void {
+    if (this.hasAppliedResumeSeek) {
+      return;
+    }
+    if (this.pendingResumePosition < RESUME_MIN_POSITION_MS) {
+      return;
+    }
+    if (this.duration > 0 && this.pendingResumePosition >= this.duration - RESUME_END_GUARD_MS) {
+      console.info(RESUME_FLOW_TAG + ' skip resume seek near end pendingResumePosition=' + this.pendingResumePosition + ' duration=' + this.duration);
+      this.clearResumePosition();
+      return;
+    }
+    try {
+      this.hasAppliedResumeSeek = true;
+      console.info(RESUME_FLOW_TAG + ' apply resume seekTo=' + this.pendingResumePosition + ' duration=' + this.duration);
+      this.ijkPlayer.seekTo(`${this.pendingResumePosition}`);
+    } catch (error) {
+      console.warn('[VideoPlayerView] apply resume seek failed');
+    }
+  }
+
+  private clearResumePosition(): void {
+    this.pendingResumePosition = 0;
+    this.hasAppliedResumeSeek = true;
+  }
   private async startPlaybackIfReady(): Promise<void> {
     if (!this.managerInitialized || this.playbackStarted || this.playbackStarting) {
       return;
@@ -216,6 +296,8 @@ export struct VideoPlayerView {
       this.playbackStarting = true;
       this.currentError = null;
       this.showErrorDialog = false;
+      this.subtitleText = '';
+      this.timedTextReady = false;
       this.ijkPlayer.setContext(this.nativeContext, VIDEO_SURFACE_COMPONENT_ID);
       this.ijkPlayer.reset();
       this.ijkPlayer.setDebug(true);
@@ -232,6 +314,7 @@ export struct VideoPlayerView {
       this.ijkPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, 'mediacodec-all-videos', '1');
       this.ijkPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, 'mediacodec-hevc', '1');
       this.ijkPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, 'overlay-format', '842094158');
+      this.ijkPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, 'subtitle', this.subtitlesEnabled ? '1' : '0');
       this.ijkPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, 'timeout', '10000000');
       this.ijkPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, 'connect_timeout', '10000000');
       this.ijkPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, 'addrinfo_timeout', '10000000');
@@ -263,6 +346,9 @@ export struct VideoPlayerView {
     this.progressTimerId = setInterval(() => {
       this.currentTime = this.ijkPlayer.getCurrentPosition();
       this.duration = this.ijkPlayer.getDuration();
+      if (this.hasExternalSubtitles()) {
+        this.updateExternalSubtitleForCurrentTime();
+      }
       if (this.saveTimerId < 0) {
         this.saveTimerId = setInterval(() => {
           this.saveProgress();
@@ -290,6 +376,7 @@ export struct VideoPlayerView {
     this.surfaceId = '';
     this.nativeContext = undefined;
     this.isBuffering = false;
+    this.subtitleText = '';
     this.stopProgressTimer();
   }
 
@@ -306,6 +393,9 @@ export struct VideoPlayerView {
     this.playbackStarted = false;
     this.playbackStarting = false;
     this.stopProgressTimer();
+    this.subtitleText = '';
+    this.pendingResumePosition = this.seekTo;
+    this.hasAppliedResumeSeek = false;
 
     try {
       this.ijkPlayer.reset();
@@ -318,18 +408,332 @@ export struct VideoPlayerView {
   private async saveProgress(): Promise<void> {
     if (this.duration <= 0) return;
 
+    const shouldClearProgress = this.currentTime >= this.duration - RESUME_END_GUARD_MS;
+    const positionToSave = shouldClearProgress ? 0 : this.currentTime;
+
     try {
+      console.info(RESUME_FLOW_TAG + ' saveProgress videoId=' + this.videoId + ' path=' + this.videoPath + ' currentTime=' + this.currentTime + ' duration=' + this.duration + ' positionToSave=' + positionToSave);
       await PlayHistoryService.getInstance().saveRecord({
         videoId: this.videoId,
         title: this.videoTitle,
         path: this.videoPath,
-        lastPosition: this.currentTime,
+        lastPosition: positionToSave,
         duration: this.duration,
         timestamp: Date.now()
       });
     } catch (error) {
       console.warn('Save progress failed.');
     }
+  }
+
+  private hasExternalSubtitles(): boolean {
+    return this.externalSubtitleCues.length > 0;
+  }
+
+  private async loadExternalSubtitles(): Promise<void> {
+    this.externalSubtitleCues = [];
+    for (const extension of SUBTITLE_EXTENSIONS) {
+      const subtitlePath = this.getSubtitlePathByExtension(extension);
+      try {
+        if (!fileIo.accessSync(subtitlePath)) {
+          continue;
+        }
+        const text = this.readSubtitleSourceText(subtitlePath);
+        const cues = this.parseSubtitleByExtension(extension, text);
+        if (cues.length > 0) {
+          this.externalSubtitleCues = cues;
+          console.info('[VideoPlayerView] loaded external subtitle path=' + subtitlePath + ' cueCount=' + cues.length);
+          return;
+        }
+      } catch (error) {
+        console.warn('[VideoPlayerView] load subtitle failed for path=' + subtitlePath);
+      }
+    }
+  }
+
+  private parseSubtitleByExtension(extension: string, content: string): SubtitleCue[] {
+    switch (extension) {
+      case '.ass':
+      case '.ssa':
+        return this.parseAss(content);
+      case '.vtt':
+        return this.parseVtt(content);
+      default:
+        return this.parseSrt(content);
+    }
+  }
+
+  private readSubtitleSourceText(subtitlePath: string): string {
+    const subtitleFile = fileIo.openSync(subtitlePath, fileIo.OpenMode.READ_ONLY);
+    try {
+      const stat = fileIo.statSync(subtitlePath);
+      const byteLength = Number(stat.size);
+      if (byteLength <= 0) {
+        return '';
+      }
+      const arrayBuffer = new ArrayBuffer(byteLength);
+      const bytesRead = fileIo.readSync(subtitleFile.fd, arrayBuffer);
+      const bytes = new Uint8Array(arrayBuffer, 0, bytesRead);
+      return this.decodeSubtitleBytes(bytes);
+    } finally {
+      fileIo.closeSync(subtitleFile);
+    }
+  }
+
+  private decodeSubtitleBytes(bytes: Uint8Array): string {
+    let bestText: string = '';
+    let bestScore: number = Number.NEGATIVE_INFINITY;
+    for (const encoding of SUBTITLE_ENCODINGS) {
+      try {
+        const decoder = util.TextDecoder.create(encoding, { fatal: false, ignoreBOM: false });
+        const decoded = decoder.decode(bytes);
+        const score = this.scoreDecodedSubtitleText(decoded);
+        if (score > bestScore) {
+          bestScore = score;
+          bestText = decoded;
+        }
+      } catch (error) {
+        console.warn('[VideoPlayerView] subtitle decode failed for encoding:', encoding);
+      }
+    }
+    return bestText;
+  }
+
+  private scoreDecodedSubtitleText(text: string): number {
+    const replacementCount = (text.match(/\uFFFD/g) ?? []).length;
+    const cueCount = (text.match(/-->|Dialogue:/g) ?? []).length;
+    const cjkCount = (text.match(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/g) ?? []).length;
+    const controlCount = (text.match(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g) ?? []).length;
+    return cueCount * 1000 + cjkCount * 10 - replacementCount * 200 - controlCount * 100;
+  }
+
+  private getSubtitlePathByExtension(extension: string): string {
+    const lastDot = this.videoPath.lastIndexOf('.');
+    const basePath = lastDot >= 0 ? this.videoPath.substring(0, lastDot) : this.videoPath;
+    return `${basePath}${extension}`;
+  }
+
+  private parseSrt(content: string): SubtitleCue[] {
+    const normalized = content.replace(/\r/g, '');
+    const blocks = normalized.split('\n\n');
+    const cues: SubtitleCue[] = [];
+    for (const block of blocks) {
+      const lines = block.split('\n').map((line: string) => line.trim());
+      if (lines.length < 2) {
+        continue;
+      }
+      const timeLineIndex = lines[0].includes('-->') ? 0 : 1;
+      if (timeLineIndex >= lines.length) {
+        continue;
+      }
+      const timeLine = lines[timeLineIndex];
+      if (!timeLine.includes('-->')) {
+        continue;
+      }
+      const textLines = lines.slice(timeLineIndex + 1).filter((line: string) => line.length > 0);
+      const cue = this.parseSubtitleCue(timeLine, textLines, ',');
+      if (cue) {
+        cues.push(cue);
+      }
+    }
+    return cues;
+  }
+
+  private parseVtt(content: string): SubtitleCue[] {
+    const normalized = content.replace(/\r/g, '');
+    const blocks = normalized.split('\n\n');
+    const cues: SubtitleCue[] = [];
+    for (const block of blocks) {
+      const lines = block.split('\n').map((line: string) => line.trim()).filter((line: string) => line.length > 0);
+      if (lines.length === 0 || lines[0] === 'WEBVTT') {
+        continue;
+      }
+      const timeLineIndex = lines[0].includes('-->') ? 0 : 1;
+      if (timeLineIndex >= lines.length) {
+        continue;
+      }
+      const timeLine = lines[timeLineIndex];
+      if (!timeLine.includes('-->')) {
+        continue;
+      }
+      const textLines = lines.slice(timeLineIndex + 1).filter((line: string) => !line.startsWith('NOTE'));
+      const cue = this.parseSubtitleCue(timeLine, textLines, '.');
+      if (cue) {
+        cues.push(cue);
+      }
+    }
+    return cues;
+  }
+
+  private parseAss(content: string): SubtitleCue[] {
+    const lines = content.replace(/\r/g, '').split('\n');
+    const cues: SubtitleCue[] = [];
+    let inEvents: boolean = false;
+    let formatFields: string[] = [];
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (line.length === 0) {
+        continue;
+      }
+      if (line.startsWith('[')) {
+        inEvents = line === '[Events]';
+        continue;
+      }
+      if (!inEvents) {
+        continue;
+      }
+      if (line.startsWith('Format:')) {
+        formatFields = line.substring('Format:'.length)
+          .split(',')
+          .map((field: string) => field.trim().toLowerCase());
+        continue;
+      }
+      if (line.startsWith('Dialogue:')) {
+        const cue = this.parseAssDialogue(line.substring('Dialogue:'.length).trim(), formatFields);
+        if (cue) {
+          cues.push(cue);
+        }
+      }
+    }
+    return cues;
+  }
+
+  private parseAssDialogue(dialogue: string, formatFields: string[]): SubtitleCue | null {
+    const fallbackFields = ['layer', 'start', 'end', 'style', 'name', 'marginl', 'marginr', 'marginv', 'effect', 'text'];
+    const fields = formatFields.length > 0 ? formatFields : fallbackFields;
+    const expectedParts = fields.length;
+    const parts: string[] = [];
+    let remaining = dialogue;
+    for (let index = 0; index < expectedParts - 1; index++) {
+      const commaIndex = remaining.indexOf(',');
+      if (commaIndex < 0) {
+        return null;
+      }
+      parts.push(remaining.substring(0, commaIndex).trim());
+      remaining = remaining.substring(commaIndex + 1);
+    }
+    parts.push(remaining);
+
+    const startIndex = fields.indexOf('start');
+    const endIndex = fields.indexOf('end');
+    const textIndex = fields.indexOf('text');
+    if (startIndex < 0 || endIndex < 0 || textIndex < 0) {
+      return null;
+    }
+    const startMs = this.parseSubtitleTimestamp(parts[startIndex].trim(), '.');
+    const endMs = this.parseSubtitleTimestamp(parts[endIndex].trim(), '.');
+    const text = this.normalizeSubtitleText(parts[textIndex]);
+    if (startMs < 0 || endMs <= startMs || text.length === 0) {
+      return null;
+    }
+    return { startMs, endMs, text };
+  }
+
+  private parseSubtitleCue(timeLine: string, textLines: string[], millisecondSeparator: string): SubtitleCue | null {
+    const segments = timeLine.split('-->');
+    if (segments.length < 2) {
+      return null;
+    }
+    const startMs = this.parseSubtitleTimestamp(segments[0].trim(), millisecondSeparator);
+    const endMs = this.parseSubtitleTimestamp(segments[1].trim().split(' ')[0], millisecondSeparator);
+    const text = this.normalizeSubtitleText(textLines.join('\n'));
+    if (startMs < 0 || endMs <= startMs || text.length === 0) {
+      return null;
+    }
+    return { startMs, endMs, text };
+  }
+
+  private parseSubtitleTimestamp(timestamp: string, millisecondSeparator: string): number {
+    const mainAndFraction = timestamp.split(millisecondSeparator);
+    if (mainAndFraction.length !== 2) {
+      return -1;
+    }
+    const parts = mainAndFraction[0].split(':').map((item: string) => Number(item));
+    if (parts.length < 2 || parts.length > 3 || parts.some((value: number) => Number.isNaN(value))) {
+      return -1;
+    }
+    const fraction = Number(mainAndFraction[1].substring(0, 3).padEnd(3, '0'));
+    if (Number.isNaN(fraction)) {
+      return -1;
+    }
+    const hours = parts.length === 3 ? parts[0] : 0;
+    const minutes = parts.length === 3 ? parts[1] : parts[0];
+    const seconds = parts.length === 3 ? parts[2] : parts[1];
+    return (((hours * 60) + minutes) * 60 + seconds) * 1000 + fraction;
+  }
+
+  private normalizeSubtitleText(text: string): string {
+    let cleaned = text
+      .replace(/^\uFEFF/, '')
+      .replace(/[\uD800-\uDFFF]/g, '')
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '')
+      .replace(/\r/g, '')
+      .replace(/\\N/gi, '\n')
+      .replace(/\\h/gi, ' ')
+      .replace(/\{[^}]*\}/g, '')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&#(\d+);/g, (_match: string, dec: string) => String.fromCharCode(Number(dec)))
+      .replace(/&#x([0-9a-fA-F]+);/g, (_match: string, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+      .replace(/[\u200B-\u200D\u2060]/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    const lastBraceIndex = cleaned.lastIndexOf('}');
+    if (lastBraceIndex >= 0 && lastBraceIndex < cleaned.length - 1) {
+      const tail = cleaned.substring(lastBraceIndex + 1).trim();
+      if (/[A-Za-z\u3400-\u4dbf\u4e00-\u9fff]/.test(tail)) {
+        cleaned = tail;
+      }
+    }
+    return this.stripSubtitleArtifacts(cleaned);
+  }
+
+  private stripSubtitleArtifacts(text: string): string {
+    const lines = text.split('\n').map((line: string) => {
+      let current = line.trim();
+      const hanIndex = current.search(/[\u3400-\u4dbf\u4e00-\u9fff]/);
+      if (hanIndex > 0) {
+        current = current.substring(hanIndex);
+      } else {
+        const alphaIndex = current.search(/[A-Za-z]/);
+        if (alphaIndex > 0 && alphaIndex <= 32) {
+          const prefix = current.substring(0, alphaIndex);
+          if (/[^A-Za-z0-9\s'"(\[【‘’“”.,:;!?-]/.test(prefix) || prefix.includes('\uFFFD')) {
+            current = current.substring(alphaIndex);
+          }
+        }
+      }
+      current = current
+        .replace(/^[^A-Za-z\u3400-\u4dbf\u4e00-\u9fff]+(?=[A-Za-z\u3400-\u4dbf\u4e00-\u9fff])/, '')
+        .replace(/\uFFFD+/g, '')
+        .trim();
+      const mixedGarbageMatch = current.match(/^[\u3400-\u4dbf\u4e00-\u9fff]{1,2}[A-Za-z]{1,4}$|^[A-Za-z]{1,4}[\u3400-\u4dbf\u4e00-\u9fff]{1,2}$/);
+      if (mixedGarbageMatch) {
+        return '';
+      }
+      return current;
+    }).filter((line: string) => line.length > 0);
+    return lines.join('\n');
+  }
+
+  private updateExternalSubtitleForCurrentTime(): void {
+    if (!this.subtitlesEnabled) {
+      this.subtitleText = '';
+      return;
+    }
+    if (!this.hasExternalSubtitles()) {
+      return;
+    }
+    const currentCue = this.externalSubtitleCues.find((cue: SubtitleCue) =>
+      this.currentTime >= cue.startMs && this.currentTime <= cue.endMs);
+    const nextSubtitleText = currentCue ? currentCue.text : '';
+    if (nextSubtitleText !== this.subtitleText) {
+      console.info('[VideoPlayerView] subtitle external currentTime=' + this.currentTime + ' text=' + JSON.stringify(nextSubtitleText));
+    }
+    this.subtitleText = nextSubtitleText;
   }
 
   build() {
@@ -349,6 +753,23 @@ export struct VideoPlayerView {
         .onDestroy(() => {
           this.handleSurfaceDestroyed();
         })
+
+      if (this.subtitlesEnabled && this.subtitleText.length > 0) {
+        Column() {
+          Blank()
+          Text(this.subtitleText)
+            .fontSize(16)
+            .fontColor('#FFFFFF')
+            .textAlign(TextAlign.Center)
+            .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+            .backgroundColor('rgba(0,0,0,0.55)')
+            .borderRadius(6)
+            .margin({ left: 20, right: 20, bottom: 92 })
+        }
+        .width('100%')
+        .height('100%')
+        .justifyContent(FlexAlign.End)
+      }
 
       ControlPanel({
         currentTime: this.currentTime,
@@ -529,3 +950,13 @@ export struct VideoPlayerView {
     .width('100%')
   }
 }
+
+
+
+
+
+
+
+
+
+
