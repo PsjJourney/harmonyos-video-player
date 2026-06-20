@@ -1,4 +1,4 @@
-﻿import { TimeUtils } from '../utils/TimeUtils';
+import { TimeUtils } from '../utils/TimeUtils';
 import { PlayerState, PlaybackSpeed } from '../common/Enums';
 
 @Component

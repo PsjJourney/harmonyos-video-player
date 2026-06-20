@@ -1,4 +1,4 @@
-﻿import { fileIo } from '@kit.CoreFileKit';
+import { fileIo } from '@kit.CoreFileKit';
 import util from '@ohos.util';
 import { VideoPlayerManager } from '../service/VideoPlayerManager';
 import { ControlPanel } from './ControlPanel';
